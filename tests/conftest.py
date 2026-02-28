@@ -10,9 +10,9 @@ def app():
     # Use test database
     os.environ['DATABASE_HOST'] = 'localhost'
     os.environ['DATABASE_PORT'] = '5432'
-    os.environ['DATABASE_NAME'] = 'test_taskapp'
-    os.environ['DATABASE_USER'] = 'test_user'
-    os.environ['DATABASE_PASSWORD'] = 'test_pass'
+    os.environ['DATABASE_NAME'] = 'testdb'      
+    os.environ['DATABASE_USER'] = 'test'        
+    os.environ['DATABASE_PASSWORD'] = 'test'
     os.environ['SECRET_KEY'] = 'test-secret-key'
     
     app = create_app()
