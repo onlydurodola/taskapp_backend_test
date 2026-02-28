@@ -14,7 +14,7 @@ on:
   pull_request:
     branches: [main]
 
-# Environment variables available to all jobs
+# Environment variables available to all jobs#
 env:
   PYTHON_VERSION: '3.11'
 
