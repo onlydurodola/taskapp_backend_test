@@ -1,0 +1,246 @@
+name: Backend CI
+
+# TRIGGER: Run on every push to main and every pull request
+on:
+  push:
+    branches: [main]
+    # Only run if these files changed
+    paths:
+      - '**.py'
+      - 'requirements.txt'
+      - 'migrations/**'
+      - 'alembic.ini'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+
+# Environment variables available to all jobs
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # JOB 1: CODE QUALITY
+  # Fast feedback: catch style issues before running tests
+  # ═══════════════════════════════════════════════════════════
+  quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1.1: Checkout repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 1.2: Setup Python with caching
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+      
+      # Step 1.3: Install linting tools
+      - name: Install linting dependencies
+        run: |
+          pip install flake8 black isort bandit
+      
+      # Step 1.4: Check code formatting with Black
+      # Black is the "uncompromising Python code formatter"
+      - name: Check formatting (Black)
+        run: black --check --diff app/ || echo "Run 'black app/' locally to fix"
+        continue-on-error: true  # Don't fail build, just warn
+      
+      # Step 1.5: Check import sorting
+      - name: Check imports (isort)
+        run: isort --check-only app/
+        continue-on-error: true
+      
+      # Step 1.6: Lint with flake8
+      # E9,F63,F7,F82 = syntax errors and undefined names (critical)
+      # E,W = style warnings (informational)
+      - name: Lint with flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings (for now)
+          flake8 app/ --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+      
+      # Step 1.7: Security scan with Bandit
+      # Finds common security issues in Python code
+      - name: Security scan (Bandit)
+        run: |
+          bandit -r app/ -f json -o bandit-report.json || true
+      
+      # Step 1.8: Upload security report as artifact
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: bandit-report.json
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 2: TEST
+  # Run unit and integration tests with coverage
+  # ═══════════════════════════════════════════════════════════
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: quality  # Wait for quality checks (fail fast)
+    
+    # Service container: PostgreSQL for integration tests
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      # Step 2.1: Install all dependencies including test tools
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-cov alembic
+          pip install -r requirements.txt
+      
+      # Step 2.2: Run database migrations for test database
+      - name: Setup test database
+        env:
+          DATABASE_HOST: localhost
+          DATABASE_PORT: 5432
+          DATABASE_NAME: testdb
+          DATABASE_USER: test
+          DATABASE_PASSWORD: test
+          SECRET_KEY: test-secret-key-not-for-production
+        run: |
+          # Create tables using migrations
+          alembic upgrade head
+      
+      # Step 2.3: Run tests with coverage
+      - name: Run pytest
+        env:
+          DATABASE_HOST: localhost
+          DATABASE_PORT: 5432
+          DATABASE_NAME: testdb
+          DATABASE_USER: test
+          DATABASE_PASSWORD: test
+          SECRET_KEY: test-secret-key-not-for-production
+          FLASK_ENV: testing
+        run: |
+          pytest \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term \
+            -v
+      
+      # Step 2.4: Upload coverage reports
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            htmlcov/
+            coverage.xml
+          retention-days: 7
+      
+      # Step 2.5: Fail if coverage below threshold (optional)
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(grep -o 'percent="[0-9]*"' coverage.xml | head -1 | grep -o '[0-9]*')
+          echo "Coverage: $COVERAGE%"
+          if [ "$COVERAGE" -lt 50 ]; then
+            echo "::warning::Coverage below 50% ($COVERAGE%)"
+          fi
+        continue-on-error: true
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 3: BUILD ARTIFACT
+  # Create deployment package only if quality and test pass
+  # ═══════════════════════════════════════════════════════════
+  build:
+    name: Build Deployment Artifact
+    runs-on: ubuntu-latest
+    needs: [quality, test]  # Both must pass
+    
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      artifact-name: ${{ steps.artifact.outputs.name }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full git history for versioning
+      
+      # Step 3.1: Generate version string
+      # Format: git-tag-or-sha-YYYYMMDD-HHMMSS
+      - name: Generate version
+        id: version
+        run: |
+          GIT_DESC=$(git describe --tags --always --dirty 2>/dev/null || git rev-parse --short HEAD)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          VERSION="${GIT_DESC}-${TIMESTAMP}"
+          echo "value=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+      
+      # Step 3.2: Create deployment package
+      - name: Create artifact
+        run: |
+          # Create clean package directory
+          mkdir -p package
+          
+          # Copy application code
+          cp -r app/ package/
+          cp -r migrations/ package/
+          cp requirements.txt package/
+          cp run.py package/
+          cp alembic.ini package/
+          
+          # Add version file for runtime visibility
+          echo "${{ steps.version.outputs.value }}" > package/VERSION
+          
+          # Create tarball
+          tar -czf backend-${{ steps.version.outputs.value }}.tar.gz -C package .
+          
+          # Verify contents
+          echo "Artifact contents:"
+          tar -tzf backend-${{ steps.version.outputs.value }}.tar.gz
+      
+      # Step 3.3: Set artifact name output
+      - name: Set artifact name
+        id: artifact
+        run: echo "name=backend-${{ steps.version.outputs.value }}" >> $GITHUB_OUTPUT
+      
+      # Step 3.4: Upload to GitHub artifact storage
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ steps.version.outputs.value }}
+          path: backend-${{ steps.version.outputs.value }}.tar.gz
+          retention-days: 30  # Keep for 30 days for rollbacks
+      
+      # Step 3.5: Summary output
+      - name: Build summary
+        run: |
+          echo "## Build Complete :package:" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ steps.version.outputs.value }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Artifact: backend-${{ steps.version.outputs.value }}.tar.gz" >> $GITHUB_STEP_SUMMARY

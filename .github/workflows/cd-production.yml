@@ -1,0 +1,217 @@
+name: CD - Deploy to Production
+
+# TRIGGER: Only after CI workflow succeeds on main branch
+on:
+  workflow_run:
+    workflows: ["Backend CI"]
+    branches: [main]
+    types:
+      - completed
+
+env:
+  AWS_REGION: eu-west-1
+  PROD_HOST: ${{ secrets.PROD_BACKEND_HOST }}
+  PROD_USER: ubuntu
+  DEPLOY_DIR: /opt/taskapp/backend
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # DEPLOY JOB
+  # Download artifact and deploy to EC2
+  # ═══════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    
+    # CRITICAL: Only deploy if CI succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      # Step 1: Download the artifact from CI workflow
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          # Use the artifact from the triggering workflow
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Download all artifacts (we'll find the right one)
+          path: ./artifacts
+      
+      # Step 2: Identify which artifact to deploy
+      - name: Find artifact
+        id: artifact
+        run: |
+          # Find the backend artifact
+          ARTIFACT=$(find ./artifacts -name "backend-*.tar.gz" | head -1)
+          if [ -z "$ARTIFACT" ]; then
+            echo "::error::No backend artifact found!"
+            exit 1
+          fi
+          echo "Found: $ARTIFACT"
+          echo "path=$ARTIFACT" >> $GITHUB_OUTPUT
+          
+          # Extract version from filename
+          VERSION=$(basename $ARTIFACT .tar.gz | sed 's/backend-//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      # Step 3: Configure AWS credentials (for potential S3, CloudWatch)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Step 4: Setup SSH key for server access
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          
+          # Add server to known hosts (prevent MITM warnings)
+          ssh-keyscan -H ${{ env.PROD_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+      
+      # Step 5: Deploy to EC2
+      # This is the critical deployment step
+      - name: Deploy to server
+        env:
+          VERSION: ${{ steps.artifact.outputs.version }}
+        run: |
+          ARTIFACT="${{ steps.artifact.outputs.path }}"
+          
+          echo "=== Starting deployment v${VERSION} ==="
+          
+          # Copy artifact to server temp location
+          scp -i ~/.ssh/deploy_key \
+            "$ARTIFACT" \
+            ${{ env.PROD_USER }}@${{ env.PROD_HOST }}:/tmp/deploy.tar.gz
+          
+          # Execute deployment commands on server
+          ssh -i ~/.ssh/deploy_key ${{ env.PROD_USER }}@${{ env.PROD_HOST }} << 'DEPLOY_EOF'
+            set -e  # Exit on any error
+            
+            echo "Creating backup of current version..."
+            if [ -d "${{ env.DEPLOY_DIR }}" ]; then
+              BACKUP_NAME="${{ env.DEPLOY_DIR }}.backup.$(date +%Y%m%d_%H%M%S)"
+              sudo cp -r "${{ env.DEPLOY_DIR }}" "$BACKUP_NAME"
+              echo "Backup created: $BACKUP_NAME"
+            fi
+            
+            echo "Extracting new version..."
+            sudo mkdir -p "${{ env.DEPLOY_DIR }}"
+            sudo tar -xzf /tmp/deploy.tar.gz -C "${{ env.DEPLOY_DIR }}" --strip-components=0
+            
+            echo "Setting permissions..."
+            sudo chown -R taskapp:taskapp "${{ env.DEPLOY_DIR }}"
+            
+            echo "Installing Python dependencies..."
+            cd "${{ env.DEPLOY_DIR }}"
+            sudo -u taskapp venv/bin/pip install -q -r requirements.txt
+            
+            echo "Running database migrations..."
+            # CRITICAL: Migrations run BEFORE service restart
+            cd "${{ env.DEPLOY_DIR }}"
+            sudo -u taskapp \
+              DATABASE_HOST="${{ secrets.DB_HOST }}" \
+              DATABASE_PORT="5432" \
+              DATABASE_NAME="${{ secrets.DB_NAME }}" \
+              DATABASE_USER="${{ secrets.DB_USER }}" \
+              DATABASE_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+              venv/bin/alembic upgrade head
+            
+            echo "Restarting application service..."
+            sudo systemctl restart taskapp-backend
+            
+            echo "Cleaning up..."
+            rm -f /tmp/deploy.tar.gz
+            
+            echo "=== Deployment complete ==="
+          DEPLOY_EOF
+      
+      # Step 6: Health check verification
+      - name: Verify deployment
+        id: health
+        run: |
+          echo "Waiting for service to start..."
+          sleep 10
+          
+          # Try health check up to 5 times
+          for i in 1 2 3 4 5; do
+            echo "Health check attempt $i..."
+            HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
+              https://api.devops-tsacademy.com/api/health || echo "000")
+            
+            if [ "$HEALTH" = "200" ]; then
+              echo "Health check passed!"
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
+            echo "Got status: $HEALTH, retrying..."
+            sleep 5
+          done
+          
+          echo "::error::Health check failed after 5 attempts"
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1
+      
+      # Step 7: Rollback on failure
+      - name: Rollback on failure
+        if: steps.health.outputs.status == 'failure'
+        run: |
+          echo "::error::Deployment failed! Rolling back..."
+          
+          ssh -i ~/.ssh/deploy_key ${{ env.PROD_USER }}@${{ env.PROD_HOST }} << 'ROLLBACK_EOF'
+            set -e
+            
+            echo "Finding latest backup..."
+            LATEST_BACKUP=$(ls -td ${{ env.DEPLOY_DIR }}.backup.* 2>/dev/null | head -1)
+            
+            if [ -z "$LATEST_BACKUP" ]; then
+              echo "::error::No backup found! Manual intervention required."
+              exit 1
+            fi
+            
+            echo "Rolling back to: $LATEST_BACKUP"
+            
+            # Stop service
+            sudo systemctl stop taskapp-backend
+            
+            # Restore backup
+            sudo rm -rf ${{ env.DEPLOY_DIR }}
+            sudo cp -r "$LATEST_BACKUP" ${{ env.DEPLOY_DIR }}
+            sudo chown -R taskapp:taskapp ${{ env.DEPLOY_DIR }}
+            
+            # Restart
+            sudo systemctl start taskapp-backend
+            
+            echo "Rollback complete"
+          ROLLBACK_EOF
+          
+          # Verify rollback worked
+          sleep 5
+          HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://api.devops-tsacademy.com/api/health || echo "000")
+          
+          if [ "$HEALTH" = "200" ]; then
+            echo "Rollback verified - service healthy"
+          else
+            echo "::error::Rollback failed! Status: $HEALTH"
+            exit 1
+          fi
+      
+      # Step 8: Deployment summary
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "## Deployment Successful :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ steps.artifact.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Server: ${{ env.PROD_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "- URL: https://api.devops-tsacademy.com" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Verification" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          curl -s https://api.devops-tsacademy.com/api/health >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
