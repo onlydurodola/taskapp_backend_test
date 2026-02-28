@@ -5,6 +5,8 @@ exclude =
     __pycache__,
     venv,
     .venv,
-    migrations/versions  # Auto-generated files
+    migrations
+
+# Correct syntax - no comments on the same line
 per-file-ignores =
-    __init__.py:F401  # Ignore unused imports in __init__.py
+    __init__.py:F401
