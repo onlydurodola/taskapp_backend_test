@@ -140,7 +140,7 @@ jobs:
           for i in 1 2 3 4 5; do
             echo "Health check attempt $i..."
             HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
-              https://api.devops-tsacademy.com/api/health || echo "000")
+              http://api.devops-tsacademy.com:5000/api/health || echo "000")
             
             if [ "$HEALTH" = "200" ]; then
               echo "Health check passed!"
