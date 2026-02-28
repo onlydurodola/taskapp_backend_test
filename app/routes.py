@@ -11,8 +11,9 @@ api_bp = Blueprint('api', __name__)
 def health_check():
     """Health check endpoint for load balancers and monitoring."""
     try:
-        # Check database connection
-        db.session.execute('SELECT 1')
+        # Check database connection using text() for SQLAlchemy 2.0 compatibility
+        from sqlalchemy import text
+        db.session.execute(text('SELECT 1'))
         return jsonify({
             'status': 'healthy',
             'database': 'connected',

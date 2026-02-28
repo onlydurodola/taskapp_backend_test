@@ -3,6 +3,8 @@ import os
 from app import create_app, db
 from app.models import User, Task
 from werkzeug.security import generate_password_hash
+from sqlalchemy import text
+
 
 @pytest.fixture
 def app():
@@ -21,6 +23,7 @@ def app():
     with app.app_context():
         db.create_all()  # Create test tables
         yield app
+        db.session.execute(text('SELECT 1'))  # Ensure connection is valid before teardown
         db.session.remove()
         db.drop_all()
 
